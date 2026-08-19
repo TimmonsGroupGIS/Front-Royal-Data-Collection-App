@@ -4,15 +4,15 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Mapillary Viewer with ArcGIS Map</title>
-    
+
     <!-- MapillaryJS -->
     <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.css" />
     <script src="https://cdn.jsdelivr.net/npm/mapillary-js@latest/dist/mapillary.min.js"></script>
-    
+
     <!-- MapLibre GL -->
     <link href="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.css" rel="stylesheet" />
     <script src="https://unpkg.com/maplibre-gl@3.6.1/dist/maplibre-gl.js"></script>
-    
+
     <style>
         * {
             margin: 0;
@@ -104,6 +104,94 @@
         }
         #expand-minimap-btn:hover {
             background: rgba(80, 80, 80, 0.9);
+        }
+        #time-filter-btn {
+            position: absolute;
+            bottom: 5px;
+            left: 38px;
+            background: rgba(100, 100, 100, 0.8);
+            color: white;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            width: 28px;
+            height: 28px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.3);
+            z-index: 1001;
+            transition: background 0.2s;
+        }
+        #time-filter-btn:hover {
+            background: rgba(80, 80, 80, 0.9);
+        }
+        #time-filter-btn.active {
+            background: #FBBC04;
+            color: #333;
+        }
+        #time-filter-panel {
+            display: none;
+            position: absolute;
+            bottom: 38px;
+            left: 5px;
+            width: 240px;
+            background: white;
+            border-radius: 6px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.4);
+            padding: 10px;
+            z-index: 1002;
+            font-size: 12px;
+            color: #333;
+        }
+        #time-filter-panel.visible {
+            display: block;
+        }
+        #time-filter-panel label {
+            display: block;
+            font-weight: bold;
+            margin: 6px 0 2px 0;
+        }
+        #time-filter-panel input[type="datetime-local"] {
+            width: 100%;
+            font-size: 11px;
+            padding: 3px;
+            box-sizing: border-box;
+        }
+        #time-filter-panel .tf-row {
+            display: flex;
+            gap: 6px;
+            margin-top: 8px;
+        }
+        #time-filter-panel button {
+            flex: 1;
+            padding: 5px 0;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 11px;
+            font-weight: bold;
+        }
+        #tf-apply-btn {
+            background: #4285F4;
+            color: white;
+        }
+        #tf-apply-btn:hover {
+            background: #3367D6;
+        }
+        #tf-reset-btn {
+            background: #e0e0e0;
+            color: #333;
+        }
+        #tf-reset-btn:hover {
+            background: #cfcfcf;
+        }
+        #tf-count {
+            margin-top: 8px;
+            font-size: 11px;
+            color: #555;
+            text-align: center;
         }
         #arcgis-container {
             width: 60%;
@@ -286,6 +374,18 @@
                 <div id="mini-map">
                     <div id="mini-map-container"></div>
                     <button id="expand-minimap-btn" title="Expand/Collapse Map">⛶</button>
+                    <button id="time-filter-btn" title="Filter by time">🕐</button>
+                    <div id="time-filter-panel">
+                        <label for="tf-start">From</label>
+                        <input type="datetime-local" id="tf-start">
+                        <label for="tf-end">To</label>
+                        <input type="datetime-local" id="tf-end">
+                        <div class="tf-row">
+                            <button id="tf-apply-btn">Apply</button>
+                            <button id="tf-reset-btn">Reset</button>
+                        </div>
+                        <div id="tf-count">No data loaded yet</div>
+                    </div>
                     <div id="mini-map-loading">Loading map data...</div>
                     <button id="reload-minimap-btn" title="Reload image data">🔄 Force API Reload</button>
                 </div>
@@ -295,7 +395,7 @@
                 </button>
             </div>
         </div>
-        
+
         <div id="arcgis-container">
             <iframe id="arcgis-map" src="https://timmons-group.maps.arcgis.com/apps/mapviewer/index.html?webmap=7450d5231ed24d3f9cb4b6c63cffe224"></iframe>
             <div id="arcgis-overlay">
@@ -311,18 +411,17 @@
             <button id="toggle-fov-btn">Show FOV</button>
         </div>
     </div>
-
     <script>
         const TOKEN = 'MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d';
         const START_ID = '1201507356387083';
         const USERNAME = 'TimmonsPavement';
         const START_DATE = '2026-08-14T00:00:00Z';
         const END_DATE = '2026-08-16T00:00:00Z';
-        
+
         let imageData = [];
         let isUpdatingFromMap = false;
         let fovOverlayVisible = false;
-
+        let activeTimeFilter = null; // { start: ms, end: ms } or null when no filter applied
         // Initialize Mapillary Viewer
         const viewer = new mapillary.Viewer({
             container: 'viewer-content',
@@ -335,7 +434,6 @@
                 zoom: true
             }
         });
-
         // Initialize mini map
         const miniMap = new maplibregl.Map({
             container: 'mini-map-container',
@@ -356,12 +454,11 @@
             center: [-78.19245575081266, 38.91797157054734],
             zoom: 14
         });
-
         // Fetch user images
         async function fetchUserImages() {
             const loadingEl = document.getElementById('mini-map-loading');
             loadingEl.classList.add('visible');
-            
+
             try {
                 console.log('Starting to fetch images...');
                 let allImages = [];
@@ -369,7 +466,7 @@
                 const startTime = Date.parse(START_DATE);
                 const endTime = Date.parse(END_DATE);
                 let requestCount = 0;
-                
+
                 while (true) {
                     const url = new URL('https://graph.mapillary.com/images');
                     url.searchParams.set('access_token', TOKEN);
@@ -377,26 +474,26 @@
                     url.searchParams.set('creator_username', USERNAME);
                     url.searchParams.set('limit', 2000);
                     if (after) url.searchParams.set('after', after);
-                    
+
                     console.log(`Request ${++requestCount}...`);
                     const response = await fetch(url);
                     if (!response.ok) {
                         console.error(`API Error: ${response.status}`);
                         break;
                     }
-                    
+
                     const data = await response.json();
                     const images = data.data || [];
                     console.log(`Got ${images.length} images`);
-                    
+
                     // Debug: Log unique usernames in the response
                     const usernames = new Set(images.map(img => img.creator_username).filter(Boolean));
                     if (usernames.size > 0) {
                         console.log('Usernames in response:', Array.from(usernames));
                     }
-                    
+
                     if (images.length === 0) break;
-                    
+
                     const filtered = images.filter(img => {
                         if (!img.captured_at) return false;
                         // Explicitly check username matches
@@ -409,27 +506,28 @@
                             return false;
                         }
                         // Date range filter
-                        let capturedTime = typeof img.captured_at === 'number' ? 
+                        let capturedTime = typeof img.captured_at === 'number' ?
                             img.captured_at : Date.parse(img.captured_at);
                         return capturedTime >= startTime && capturedTime < endTime;
                     });
-                    
+
                     console.log(`Filtered to ${filtered.length} images in date range`);
                     allImages = allImages.concat(filtered);
                     loadingEl.textContent = `Loading: ${allImages.length} images...`;
-                    
+
                     if (data.paging?.cursors?.after) {
                         after = data.paging.cursors.after;
                     } else {
                         break;
                     }
-                    
-                    if (requestCount >= 30 || allImages.length >= 60000) break;
+
+                    if (requestCount >= 13 || allImages.length >= 26000) break;
                 }
-                
+
                 console.log(`Total images loaded: ${allImages.length}`);
                 imageData = allImages;
                 loadingEl.classList.remove('visible');
+                initTimeFilterControls();
                 addImagesToMiniMap();
             } catch (err) {
                 console.error('Error fetching images:', err);
@@ -437,20 +535,62 @@
                 setTimeout(() => loadingEl.classList.remove('visible'), 3000);
             }
         }
-
+        // Returns the captured_at value for an image as a millisecond timestamp
+        function getCapturedTimeMs(img) {
+            if (!img.captured_at) return null;
+            return typeof img.captured_at === 'number' ? img.captured_at : Date.parse(img.captured_at);
+        }
+        // Formats a millisecond timestamp for a datetime-local input (uses local time)
+        function msToDatetimeLocal(ms) {
+            const d = new Date(ms);
+            const pad = n => String(n).padStart(2, '0');
+            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+        }
+        // Populates the time filter panel's min/max/default values based on loaded imageData
+        function initTimeFilterControls() {
+            const times = imageData.map(getCapturedTimeMs).filter(t => t !== null && !isNaN(t));
+            const startInput = document.getElementById('tf-start');
+            const endInput = document.getElementById('tf-end');
+            const countEl = document.getElementById('tf-count');
+            if (times.length === 0) {
+                countEl.textContent = 'No timestamped images loaded';
+                startInput.value = '';
+                endInput.value = '';
+                return;
+            }
+            const minTime = Math.min(...times);
+            const maxTime = Math.max(...times);
+            const minVal = msToDatetimeLocal(minTime);
+            const maxVal = msToDatetimeLocal(maxTime);
+            startInput.min = minVal;
+            startInput.max = maxVal;
+            endInput.min = minVal;
+            endInput.max = maxVal;
+            startInput.value = minVal;
+            endInput.value = maxVal;
+            countEl.textContent = `Showing ${imageData.length} of ${imageData.length} images`;
+        }
+        // Returns imageData filtered by the active time filter (or all imageData if none set)
+        function getFilteredImageData() {
+            if (!activeTimeFilter) return imageData;
+            return imageData.filter(img => {
+                const t = getCapturedTimeMs(img);
+                if (t === null || isNaN(t)) return false;
+                return t >= activeTimeFilter.start && t <= activeTimeFilter.end;
+            });
+        }
         function addImagesToMiniMap() {
-            console.log(`Adding ${imageData.length} images to mini map`);
-            
-            const features = imageData
+            const filteredData = getFilteredImageData();
+            console.log(`Adding ${filteredData.length} images to mini map`);
+
+            const features = filteredData
                 .filter(img => img.geometry?.coordinates)
                 .map(img => ({
                     type: 'Feature',
                     geometry: { type: 'Point', coordinates: img.geometry.coordinates },
                     properties: { id: img.id }
                 }));
-
             console.log(`Created ${features.length} features for map`);
-
             const addLayers = () => {
                 if (miniMap.getSource('images')) {
                     console.log('Updating existing source');
@@ -461,7 +601,6 @@
                         type: 'geojson',
                         data: { type: 'FeatureCollection', features }
                     });
-
                     miniMap.addLayer({
                         id: 'image-points',
                         type: 'circle',
@@ -473,12 +612,10 @@
                             'circle-stroke-color': '#1565C0'
                         }
                     });
-
                     miniMap.addSource('current', {
                         type: 'geojson',
                         data: { type: 'FeatureCollection', features: [] }
                     });
-
                     miniMap.addLayer({
                         id: 'current-point',
                         type: 'circle',
@@ -490,12 +627,10 @@
                             'circle-stroke-color': '#fff'
                         }
                     });
-
                     miniMap.addSource('fov', {
                         type: 'geojson',
                         data: { type: 'FeatureCollection', features: [] }
                     });
-
                     miniMap.addLayer({
                         id: 'fov-wedge',
                         type: 'fill',
@@ -505,7 +640,6 @@
                             'fill-opacity': 0.4
                         }
                     });
-
                     miniMap.addLayer({
                         id: 'fov-outline',
                         type: 'line',
@@ -515,7 +649,6 @@
                             'line-width': 2
                         }
                     });
-
                     miniMap.on('click', 'image-points', async (e) => {
                         if (isUpdatingFromMap) return;
                         const feature = e.features[0];
@@ -530,16 +663,13 @@
                             setTimeout(() => { isUpdatingFromMap = false; }, 300);
                         }
                     });
-
                     miniMap.on('mouseenter', 'image-points', () => {
                         miniMap.getCanvas().style.cursor = 'pointer';
                     });
-
                     miniMap.on('mouseleave', 'image-points', () => {
                         miniMap.getCanvas().style.cursor = '';
                     });
                 }
-
                 if (features.length > 0) {
                     const coords = features.map(f => f.geometry.coordinates);
                     const bounds = coords.reduce((bounds, coord) => {
@@ -549,20 +679,18 @@
                     console.log('Fitted bounds to show all images');
                 }
             };
-
             if (miniMap.loaded() || miniMap.isStyleLoaded?.()) {
                 addLayers();
             } else {
                 miniMap.once('load', addLayers);
             }
         }
-
         async function updateMiniMapPosition() {
             if (isUpdatingFromMap) return;
             try {
                 const pos = await viewer.getPosition();
                 const pov = await viewer.getPointOfView();
-                
+
                 if (miniMap.getSource('current')) {
                     miniMap.getSource('current').setData({
                         type: 'FeatureCollection',
@@ -572,14 +700,14 @@
                         }]
                     });
                 }
-                
+
                 if (miniMap.getSource('fov')) {
                     const fovDegrees = 90;
                     const radius = 0.0002;
                     const bearing = pov.bearing;
-                    
+
                     const wedge = createFOVWedge(pos.lng, pos.lat, bearing, fovDegrees, radius);
-                    
+
                     miniMap.getSource('fov').setData({
                         type: 'FeatureCollection',
                         features: [{
@@ -591,60 +719,56 @@
                         }]
                     });
                 }
-                
+
                 updateArcGISOverlay(pov.bearing);
             } catch (err) {
                 console.error('Error updating mini map:', err);
             }
         }
-
         function updateArcGISOverlay(bearing) {
             if (!fovOverlayVisible) return;
-            
+
             const fovDegrees = 90;
             const path = createFOVWedgeSVG(50, 50, bearing, fovDegrees, 40);
             document.getElementById('fov-wedge-path').setAttribute('d', path);
         }
-
         function createFOVWedgeSVG(cx, cy, bearing, fovDegrees, radius) {
             const halfFOV = fovDegrees / 2;
             const numPoints = 20;
-            
+
             let path = `M ${cx} ${cy}`;
-            
+
             for (let i = 0; i <= numPoints; i++) {
                 const angle = bearing - halfFOV + (fovDegrees * i / numPoints);
                 const angleRad = (angle - 90) * Math.PI / 180;
-                
+
                 const x = cx + radius * Math.cos(angleRad);
                 const y = cy + radius * Math.sin(angleRad);
-                
+
                 path += ` L ${x} ${y}`;
             }
-            
+
             path += ' Z';
             return path;
         }
-
         function createFOVWedge(lng, lat, bearing, fovDegrees, radius) {
             const points = [[lng, lat]];
             const halfFOV = fovDegrees / 2;
             const numPoints = 20;
-            
+
             for (let i = 0; i <= numPoints; i++) {
                 const angle = bearing - halfFOV + (fovDegrees * i / numPoints);
                 const angleRad = angle * Math.PI / 180;
-                
+
                 const dx = radius * Math.sin(angleRad);
                 const dy = radius * Math.cos(angleRad);
-                
+
                 points.push([lng + dx, lat + dy]);
             }
-            
+
             points.push([lng, lat]);
             return points;
         }
-
         viewer.on('load', () => {
             document.getElementById('loading').style.display = 'none';
             updateMiniMapPosition();
@@ -652,24 +776,24 @@
         viewer.on('image', updateMiniMapPosition);
         viewer.on('position', updateMiniMapPosition);
         viewer.on('pov', updateMiniMapPosition);
-
         document.getElementById('mapillary-link-btn').addEventListener('click', () => {
             window.open('https://www.mapillary.com/app/user/TimmonsPavement?lat=38.91797157054734&lng=-78.19245575081266&z=14&dateFrom=2026-08-14&username%5B%5D=TimmonsPavement&dateTo=2026-08-15&pKey=711601415300444', '_blank');
         });
-
         document.getElementById('reload-minimap-btn').addEventListener('click', () => {
             const btn = document.getElementById('reload-minimap-btn');
             btn.disabled = true;
             btn.textContent = '⏳ Loading...';
-            
+
             imageData = [];
+            activeTimeFilter = null;
+            document.getElementById('time-filter-btn').classList.remove('active');
             if (miniMap.getSource('images')) {
                 miniMap.getSource('images').setData({
                     type: 'FeatureCollection',
                     features: []
                 });
             }
-            
+
             fetchUserImages().then(() => {
                 btn.disabled = false;
                 btn.textContent = '🔄 Reload';
@@ -678,17 +802,57 @@
                 btn.textContent = '🔄 Reload';
             });
         });
-
+        // Toggle the time filter panel open/closed
+        document.getElementById('time-filter-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            document.getElementById('time-filter-panel').classList.toggle('visible');
+        });
+        // Apply the selected date/time range as a filter on the mini map's image points
+        document.getElementById('tf-apply-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            const startInput = document.getElementById('tf-start');
+            const endInput = document.getElementById('tf-end');
+            const countEl = document.getElementById('tf-count');
+            const startVal = startInput.value;
+            const endVal = endInput.value;
+            if (!startVal || !endVal) {
+                countEl.textContent = 'Please select both a start and end time';
+                return;
+            }
+            const startMs = new Date(startVal).getTime();
+            const endMs = new Date(endVal).getTime();
+            if (isNaN(startMs) || isNaN(endMs) || startMs > endMs) {
+                countEl.textContent = 'Invalid date range';
+                return;
+            }
+            activeTimeFilter = { start: startMs, end: endMs };
+            const filteredCount = getFilteredImageData().length;
+            countEl.textContent = `Showing ${filteredCount} of ${imageData.length} images`;
+            document.getElementById('time-filter-btn').classList.add('active');
+            addImagesToMiniMap();
+        });
+        // Reset the time filter back to showing all loaded images
+        document.getElementById('tf-reset-btn').addEventListener('click', (e) => {
+            e.stopPropagation();
+            activeTimeFilter = null;
+            document.getElementById('time-filter-btn').classList.remove('active');
+            initTimeFilterControls();
+            addImagesToMiniMap();
+        });
+        // Prevent clicks inside the panel from closing it via any future document-level listeners
+        document.getElementById('time-filter-panel').addEventListener('click', (e) => {
+            e.stopPropagation();
+        });
         document.getElementById('sync-btn').addEventListener('click', async () => {
             try {
                 const pos = await viewer.getPosition();
                 const arcgisZoom = 20;
-                
+
                 const iframe = document.getElementById('arcgis-map');
                 const baseUrl = 'https://timmons-group.maps.arcgis.com/apps/mapviewer/index.html';
                 const newUrl = `${baseUrl}?webmap=7450d5231ed24d3f9cb4b6c63cffe224&center=${pos.lng},${pos.lat}&level=${arcgisZoom}`;
                 iframe.src = newUrl;
-                
+
                 const btn = document.getElementById('sync-btn');
                 const originalText = btn.textContent;
                 btn.textContent = '✓ Synced!';
@@ -702,12 +866,11 @@
                 alert('Could not sync position. Please try again.');
             }
         });
-
         document.getElementById('edit-btn').addEventListener('click', async () => {
             try {
                 const pos = await viewer.getPosition();
                 const arcgisZoom = 20;
-                
+
                 const baseUrl = 'https://timmons-group.maps.arcgis.com/apps/webeditor/index.html';
                 const editorUrl = `${baseUrl}?webmap=7450d5231ed24d3f9cb4b6c63cffe224&center=${pos.lng},${pos.lat}&level=${arcgisZoom}`;
                 window.open(editorUrl, '_blank');
@@ -716,12 +879,11 @@
                 alert('Could not get current position. Please try again.');
             }
         });
-
         document.getElementById('toggle-fov-btn').addEventListener('click', () => {
             fovOverlayVisible = !fovOverlayVisible;
             const overlay = document.getElementById('arcgis-overlay');
             const btn = document.getElementById('toggle-fov-btn');
-            
+
             if (fovOverlayVisible) {
                 overlay.classList.add('visible');
                 btn.classList.add('active');
@@ -733,15 +895,14 @@
                 btn.textContent = 'Show FOV';
             }
         });
-
         // Toggle mini map expansion
         document.getElementById('expand-minimap-btn').addEventListener('click', (e) => {
             e.stopPropagation(); // Prevent event bubbling
             const miniMapElement = document.getElementById('mini-map');
             const expandBtn = document.getElementById('expand-minimap-btn');
-            
+
             miniMapElement.classList.toggle('expanded');
-            
+
             // Change icon based on state
             if (miniMapElement.classList.contains('expanded')) {
                 expandBtn.textContent = '⛶'; // Could also use '✕' or '◱'
@@ -750,13 +911,12 @@
                 expandBtn.textContent = '⛶';
                 expandBtn.title = 'Expand Map';
             }
-            
+
             // Resize the map after transition completes
             setTimeout(() => {
                 miniMap.resize();
             }, 300);
         });
-
         fetchUserImages();
     </script>
 </body>
