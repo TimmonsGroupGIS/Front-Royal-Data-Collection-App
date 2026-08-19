@@ -498,177 +498,110 @@
             center: [-78.19245575081266, 38.91797157054734],
             zoom: 14
         });
-        const FIELDS = 'id,geometry,sequence,captured_at,is_pano,creator_username';
+        // The capture rig's clock reads consistently 4 hours ahead of actual local
+        // capture time (e.g. an image actually taken at 10:45am is recorded/converts
+        // to 2:45pm). This constant corrects for that at ingestion, before the
+        // timestamp is used anywhere else (filtering, display, day-bucketing). Since
+        // it's a flat shift on the underlying epoch value, it can push a timestamp
+        // that reads just after local midnight back to just before it (and vice
+        // versa) — that's expected and is handled correctly by everything downstream
+        // since day-bucketing/display all key off this already-corrected value.
+        const CAPTURED_AT_OFFSET_MS = -4 * 60 * 60 * 1000;
 
-        // Performs a single fetch with retries on transient failures.
-        // Returns the parsed JSON body, or null if all attempts failed.
-        async function fetchWithRetries(url, attempts = 3) {
-            let response = null;
-            for (let attempt = 1; attempt <= attempts; attempt++) {
-                try {
-                    response = await fetch(url);
-                } catch (networkErr) {
-                    response = null;
-                }
-                if (response && response.ok) return await response.json();
-                if (attempt < attempts) {
-                    await new Promise(r => setTimeout(r, 700 * attempt));
-                }
-            }
-            const bodyText = await response?.text?.().catch(() => '') || '';
-            console.error(`API request failed after ${attempts} attempts: status ${response?.status}. Body: ${bodyText}`);
-            return null;
-        }
-
-        // Keeps only images matching this tool's target user / capture-type / date window.
-        function passesImageFilters(img, startTime, endTime) {
-            if (!img.captured_at) return false;
-            if (img.creator_username && img.creator_username !== USERNAME) return false;
-            if (!img.is_pano) return false;
-            const t = typeof img.captured_at === 'number' ? img.captured_at : Date.parse(img.captured_at);
-            return t >= startTime && t < endTime;
-        }
-
-        // Legacy strategy: one big query, paginated via the `after` cursor.
-        // The Mapillary Graph API has been observed to fail with a 500 error on deep
-        // cursor pagination (around ~20k+ records into a single query) — when that
-        // happens, everything *before* the failure point in the pagination order
-        // (which is newest-first) never gets fetched at all, silently truncating the
-        // OLDEST portion of the capture session. This is kept as a fallback only.
-        async function fetchImagesLegacy(startTime, endTime, loadingEl) {
-            let allImages = [];
-            let after = null;
-            let requestCount = 0;
-            let stoppedEarlyDueToError = false;
-
-            while (true) {
-                const url = new URL('https://graph.mapillary.com/images');
-                url.searchParams.set('access_token', TOKEN);
-                url.searchParams.set('fields', FIELDS);
-                url.searchParams.set('creator_username', USERNAME);
-                url.searchParams.set('limit', 2000);
-                if (after) url.searchParams.set('after', after);
-
-                console.log(`[legacy] Request ${++requestCount}...`);
-                const data = await fetchWithRetries(url);
-                if (!data) { stoppedEarlyDueToError = true; break; }
-
-                const images = data.data || [];
-                if (images.length === 0) break;
-
-                const filtered = images.filter(img => passesImageFilters(img, startTime, endTime));
-                allImages = allImages.concat(filtered);
-                loadingEl.textContent = `Loading: ${allImages.length} images...`;
-
-                if (data.paging?.cursors?.after) {
-                    after = data.paging.cursors.after;
-                } else {
-                    break;
-                }
-                if (requestCount >= 13 || allImages.length >= 26000) break;
-            }
-            return { images: allImages, incompleteRanges: stoppedEarlyDueToError ? [{ start: startTime, end: endTime }] : [] };
-        }
-
-        // Preferred strategy: split the target window into small time chunks and query
-        // each with start_captured_at/end_captured_at directly, so every chunk's page
-        // count stays small and a failure only drops that one time slice (clearly
-        // reported) instead of truncating everything before some arbitrary cursor depth.
-        async function fetchImagesChunked(startTime, endTime, loadingEl) {
-            const CHUNK_MS = 30 * 60 * 1000; // 30-minute windows
-            let allImages = [];
-            const incompleteRanges = [];
-            let chunkStart = startTime;
-            let chunkIndex = 0;
-            const totalChunks = Math.ceil((endTime - startTime) / CHUNK_MS);
-
-            while (chunkStart < endTime) {
-                const chunkEnd = Math.min(chunkStart + CHUNK_MS, endTime);
-                chunkIndex++;
-                let after = null;
-                let chunkOk = true;
-                let pageCount = 0;
-
-                while (true) {
-                    const url = new URL('https://graph.mapillary.com/images');
-                    url.searchParams.set('access_token', TOKEN);
-                    url.searchParams.set('fields', FIELDS);
-                    url.searchParams.set('creator_username', USERNAME);
-                    url.searchParams.set('start_captured_at', new Date(chunkStart).toISOString());
-                    url.searchParams.set('end_captured_at', new Date(chunkEnd).toISOString());
-                    url.searchParams.set('limit', 2000);
-                    if (after) url.searchParams.set('after', after);
-
-                    const data = await fetchWithRetries(url);
-                    if (!data) { chunkOk = false; break; }
-
-                    const images = data.data || [];
-                    const filtered = images.filter(img => passesImageFilters(img, startTime, endTime));
-                    allImages = allImages.concat(filtered);
-                    pageCount++;
-
-                    if (images.length === 0 || !data.paging?.cursors?.after || pageCount >= 10) break;
-                    after = data.paging.cursors.after;
-                }
-
-                if (!chunkOk) {
-                    incompleteRanges.push({ start: chunkStart, end: chunkEnd });
-                    console.error(`Chunk ${msToUtcDisplay(chunkStart)}–${msToUtcDisplay(chunkEnd)} failed after retries; skipping.`);
-                }
-
-                loadingEl.textContent = `Loading ${chunkIndex}/${totalChunks} (${msToUtcDisplay(chunkStart)}): ${allImages.length} images so far...`;
-                chunkStart = chunkEnd;
-                if (allImages.length >= 60000) break;
-            }
-            return { images: allImages, incompleteRanges };
-        }
-        function msToUtcDisplay(ms) {
-            return new Date(ms).toISOString().slice(0, 16).replace('T', ' ');
-        }
-        // Checks whether the API accepts start_captured_at/end_captured_at as filters
-        // (some Graph API deployments/token scopes may not). Falls back to the legacy
-        // cursor-only strategy if not.
-        async function supportsCapturedAtRangeParams() {
-            try {
-                const url = new URL('https://graph.mapillary.com/images');
-                url.searchParams.set('access_token', TOKEN);
-                url.searchParams.set('fields', 'id');
-                url.searchParams.set('creator_username', USERNAME);
-                url.searchParams.set('start_captured_at', START_DATE);
-                url.searchParams.set('end_captured_at', END_DATE);
-                url.searchParams.set('limit', 1);
-                const resp = await fetch(url);
-                return resp.ok;
-            } catch (e) {
-                return false;
-            }
-        }
         // Fetch user images
         async function fetchUserImages() {
             const loadingEl = document.getElementById('mini-map-loading');
             loadingEl.classList.add('visible');
+            let stoppedEarlyDueToError = false;
 
             try {
                 console.log('Starting to fetch images...');
+                let allImages = [];
+                let after = null;
                 const startTime = Date.parse(START_DATE);
                 const endTime = Date.parse(END_DATE);
+                let requestCount = 0;
 
-                const canChunk = await supportsCapturedAtRangeParams();
-                console.log(canChunk ? 'Using chunked fetch (start_captured_at/end_captured_at supported).'
-                                      : 'start_captured_at/end_captured_at not supported by this token/endpoint — using legacy cursor fetch.');
+                while (true) {
+                    const url = new URL('https://graph.mapillary.com/images');
+                    url.searchParams.set('access_token', TOKEN);
+                    url.searchParams.set('fields', 'id,geometry,sequence,captured_at,is_pano,creator_username');
+                    url.searchParams.set('creator_username', USERNAME);
+                    url.searchParams.set('limit', 2000);
+                    if (after) url.searchParams.set('after', after);
 
-                const result = canChunk
-                    ? await fetchImagesChunked(startTime, endTime, loadingEl)
-                    : await fetchImagesLegacy(startTime, endTime, loadingEl);
+                    console.log(`Request ${++requestCount}...`);
 
-                console.log(`Total images loaded: ${result.images.length}`);
-                imageData = result.images;
+                    // The Mapillary Graph API occasionally returns a transient 5xx on deep
+                    // pagination. Retry a couple of times before giving up on this page.
+                    let response = null;
+                    for (let attempt = 1; attempt <= 3; attempt++) {
+                        try {
+                            response = await fetch(url);
+                        } catch (networkErr) {
+                            response = null;
+                        }
+                        if (response && response.ok) break;
+                        if (attempt < 3) {
+                            console.warn(`Request ${requestCount} attempt ${attempt} failed (status ${response?.status}), retrying...`);
+                            await new Promise(r => setTimeout(r, 700 * attempt));
+                        }
+                    }
 
-                if (result.incompleteRanges.length > 0) {
-                    const ranges = result.incompleteRanges.map(r => `${msToUtcDisplay(r.start)}–${msToUtcDisplay(r.end)} UTC`).join(', ');
-                    loadingEl.textContent = `⚠️ Loaded ${result.images.length} images. Some time ranges failed and may be missing: ${ranges}`;
+                    if (!response || !response.ok) {
+                        const bodyText = await response?.text?.().catch(() => '') || '';
+                        console.error(`API Error: ${response?.status}. Body: ${bodyText}`);
+                        stoppedEarlyDueToError = true;
+                        break;
+                    }
+
+                    const data = await response.json();
+                    const images = data.data || [];
+                    console.log(`Got ${images.length} images`);
+
+                    // Debug: Log unique usernames in the response
+                    const usernames = new Set(images.map(img => img.creator_username).filter(Boolean));
+                    if (usernames.size > 0) {
+                        console.log('Usernames in response:', Array.from(usernames));
+                    }
+
+                    if (images.length === 0) break;
+
+                    const filtered = images.filter(img => {
+                        if (!img.captured_at) return false;
+                        // Explicitly check username matches
+                        if (img.creator_username && img.creator_username !== USERNAME) {
+                            console.log(`Filtering out image from user: ${img.creator_username}`);
+                            return false;
+                        }
+                        // Filter for 360 images only
+                        if (!img.is_pano) {
+                            return false;
+                        }
+                        // Date range filter (against the clock-corrected time)
+                        const capturedTime = getCapturedTimeMs(img);
+                        return capturedTime !== null && capturedTime >= startTime && capturedTime < endTime;
+                    });
+
+                    console.log(`Filtered to ${filtered.length} images in date range`);
+                    allImages = allImages.concat(filtered);
+                    loadingEl.textContent = `Loading: ${allImages.length} images...`;
+
+                    if (data.paging?.cursors?.after) {
+                        after = data.paging.cursors.after;
+                    } else {
+                        break;
+                    }
+
+                    if (requestCount >= 13 || allImages.length >= 26000) break;
+                }
+
+                console.log(`Total images loaded: ${allImages.length}`);
+                imageData = allImages;
+                if (stoppedEarlyDueToError) {
+                    loadingEl.textContent = `⚠️ Loaded ${allImages.length} images (API stopped early — data may be incomplete)`;
                     loadingEl.classList.add('visible');
-                    console.warn('Incomplete time ranges (API errors after retries):', result.incompleteRanges);
+                    setTimeout(() => loadingEl.classList.remove('visible'), 8000);
                 } else {
                     loadingEl.classList.remove('visible');
                 }
@@ -692,10 +625,13 @@
             for (let i = 1; i < arr.length; i++) if (arr[i] > m) m = arr[i];
             return m;
         }
-        // Returns the captured_at value for an image as a millisecond timestamp
+        // Returns the captured_at value for an image as a millisecond timestamp,
+        // corrected for the capture rig's clock offset (see CAPTURED_AT_OFFSET_MS).
         function getCapturedTimeMs(img) {
             if (!img.captured_at) return null;
-            return typeof img.captured_at === 'number' ? img.captured_at : Date.parse(img.captured_at);
+            const raw = typeof img.captured_at === 'number' ? img.captured_at : Date.parse(img.captured_at);
+            if (isNaN(raw)) return null;
+            return raw + CAPTURED_AT_OFFSET_MS;
         }
         // Formats a millisecond timestamp for a datetime-local input (uses local time)
         function msToDatetimeLocal(ms) {
