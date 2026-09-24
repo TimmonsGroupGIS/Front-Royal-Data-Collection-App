@@ -419,9 +419,9 @@
                     <button id="time-filter-btn" title="Filter by time">🕐</button>
                     <div id="time-filter-panel">
                         <div id="tf-presets"></div>
-                        <label for="tf-start">From</label>
+                        <label for="tf-start">From (Eastern)</label>
                         <input type="datetime-local" id="tf-start" step="1">
-                        <label for="tf-end">To</label>
+                        <label for="tf-end">To (Eastern)</label>
                         <input type="datetime-local" id="tf-end" step="1">
                         <div class="tf-row">
                             <button id="tf-apply-btn">Apply</button>
@@ -459,8 +459,19 @@
         const TOKEN = 'MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d';
         const START_ID = '1201507356387083';
         const USERNAME = 'TimmonsPavement';
-        const START_DATE = '2026-08-14T00:00:00Z';
-        const END_DATE = '2026-08-16T00:00:00Z';
+
+        // All times in the UI (filter inputs, day presets, hint text) are shown in
+        // US Eastern time, regardless of the timezone of the computer viewing the app.
+        // America/New_York handles EDT (UTC-4, summer) vs EST (UTC-5, winter) automatically.
+        const DISPLAY_TZ = 'America/New_York';
+
+        // Collection window, expressed in Eastern time. Covers all of Aug 14 AND
+        // Aug 15 (end is exclusive: midnight starting Aug 16 Eastern).
+        const START_DATE = '2026-08-14T00:00:00-04:00';
+        const END_DATE   = '2026-08-16T00:00:00-04:00';
+
+        // Max pages of 2000 to pull from the Graph API (safety cap).
+        const MAX_REQUESTS = 40;
 
         let imageData = [];
         let isUpdatingFromMap = false;
@@ -498,15 +509,45 @@
             center: [-78.19245575081266, 38.91797157054734],
             zoom: 14
         });
-        // The capture rig's clock reads consistently 4 hours ahead of actual local
-        // capture time (e.g. an image actually taken at 10:45am is recorded/converts
-        // to 2:45pm). This constant corrects for that at ingestion, before the
-        // timestamp is used anywhere else (filtering, display, day-bucketing). Since
-        // it's a flat shift on the underlying epoch value, it can push a timestamp
-        // that reads just after local midnight back to just before it (and vice
-        // versa) — that's expected and is handled correctly by everything downstream
-        // since day-bucketing/display all key off this already-corrected value.
-        const CAPTURED_AT_OFFSET_MS = -4 * 60 * 60 * 1000;
+
+        // ---------- Eastern-time helpers ----------
+        const easternPartsFmt = new Intl.DateTimeFormat('en-US', {
+            timeZone: DISPLAY_TZ,
+            year: 'numeric', month: '2-digit', day: '2-digit',
+            hour: '2-digit', minute: '2-digit', second: '2-digit',
+            hourCycle: 'h23'
+        });
+        // Returns {year, month, day, hour, minute, second} for a ms timestamp, in Eastern time
+        function getEasternParts(ms) {
+            const out = {};
+            easternPartsFmt.formatToParts(new Date(ms)).forEach(p => {
+                if (p.type !== 'literal') out[p.type] = parseInt(p.value, 10);
+            });
+            if (out.hour === 24) out.hour = 0;
+            return out;
+        }
+        // Offset (ms) of Eastern time from UTC at the given instant (e.g. -4h during EDT)
+        function easternOffsetMs(ms) {
+            const p = getEasternParts(ms);
+            const asUtc = Date.UTC(p.year, p.month - 1, p.day, p.hour, p.minute, p.second);
+            return asUtc - Math.floor(ms / 1000) * 1000;
+        }
+        // 'YYYY-MM-DD' key for the Eastern calendar date of a timestamp
+        function easternDayKey(ms) {
+            const p = getEasternParts(ms);
+            const pad = n => String(n).padStart(2, '0');
+            return `${p.year}-${pad(p.month)}-${pad(p.day)}`;
+        }
+
+        // Returns the captured_at value for an image as a true UTC millisecond timestamp.
+        // Mapillary's captured_at is already correct UTC — the "4 hour difference" was
+        // just UTC vs Eastern, which is now handled at display time instead.
+        function getCapturedTimeMs(img) {
+            if (!img.captured_at) return null;
+            const raw = typeof img.captured_at === 'number' ? img.captured_at : Date.parse(img.captured_at);
+            if (isNaN(raw)) return null;
+            return raw;
+        }
 
         // Fetch user images
         async function fetchUserImages() {
@@ -527,6 +568,10 @@
                     url.searchParams.set('access_token', TOKEN);
                     url.searchParams.set('fields', 'id,geometry,sequence,captured_at,is_pano,creator_username');
                     url.searchParams.set('creator_username', USERNAME);
+                    // Ask the API for just the collection window so pagination isn't
+                    // spent on unrelated captures (this is what was cutting off the 15th).
+                    url.searchParams.set('start_captured_at', new Date(startTime).toISOString());
+                    url.searchParams.set('end_captured_at', new Date(endTime).toISOString());
                     url.searchParams.set('limit', 2000);
                     if (after) url.searchParams.set('after', after);
 
@@ -559,7 +604,6 @@
                     const images = data.data || [];
                     console.log(`Got ${images.length} images`);
 
-                    // Debug: Log unique usernames in the response
                     const usernames = new Set(images.map(img => img.creator_username).filter(Boolean));
                     if (usernames.size > 0) {
                         console.log('Usernames in response:', Array.from(usernames));
@@ -569,7 +613,6 @@
 
                     const filtered = images.filter(img => {
                         if (!img.captured_at) return false;
-                        // Explicitly check username matches
                         if (img.creator_username && img.creator_username !== USERNAME) {
                             console.log(`Filtering out image from user: ${img.creator_username}`);
                             return false;
@@ -578,7 +621,7 @@
                         if (!img.is_pano) {
                             return false;
                         }
-                        // Date range filter (against the clock-corrected time)
+                        // Date range filter (belt-and-braces with the API-side filter)
                         const capturedTime = getCapturedTimeMs(img);
                         return capturedTime !== null && capturedTime >= startTime && capturedTime < endTime;
                     });
@@ -593,7 +636,11 @@
                         break;
                     }
 
-                    if (requestCount >= 13 || allImages.length >= 26000) break;
+                    if (requestCount >= MAX_REQUESTS) {
+                        console.warn(`Hit MAX_REQUESTS (${MAX_REQUESTS}); stopping pagination.`);
+                        stoppedEarlyDueToError = true;
+                        break;
+                    }
                 }
 
                 console.log(`Total images loaded: ${allImages.length}`);
@@ -625,24 +672,29 @@
             for (let i = 1; i < arr.length; i++) if (arr[i] > m) m = arr[i];
             return m;
         }
-        // Returns the captured_at value for an image as a millisecond timestamp,
-        // corrected for the capture rig's clock offset (see CAPTURED_AT_OFFSET_MS).
-        function getCapturedTimeMs(img) {
-            if (!img.captured_at) return null;
-            const raw = typeof img.captured_at === 'number' ? img.captured_at : Date.parse(img.captured_at);
-            if (isNaN(raw)) return null;
-            return raw + CAPTURED_AT_OFFSET_MS;
-        }
-        // Formats a millisecond timestamp for a datetime-local input (uses local time)
+        // Formats a ms timestamp as a datetime-local value in Eastern wall-clock time
         function msToDatetimeLocal(ms) {
-            const d = new Date(ms);
+            const p = getEasternParts(ms);
             const pad = n => String(n).padStart(2, '0');
-            return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
+            return `${p.year}-${pad(p.month)}-${pad(p.day)}T${pad(p.hour)}:${pad(p.minute)}:${pad(p.second)}`;
         }
-        // Formats a millisecond timestamp for human-readable display (local time)
+        // Parses a datetime-local value, interpreting it as Eastern wall-clock time
+        function datetimeLocalToMs(val) {
+            const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?/.exec(val || '');
+            if (!m) return NaN;
+            const wall = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+            let guess = wall - easternOffsetMs(wall);
+            guess = wall - easternOffsetMs(guess); // refine across DST boundaries
+            return guess;
+        }
+        // Human-readable Eastern time, e.g. "Aug 14, 2026, 10:45:12 AM EDT"
         function msToDisplay(ms) {
-            const d = new Date(ms);
-            return d.toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'medium' });
+            return new Date(ms).toLocaleString('en-US', {
+                timeZone: DISPLAY_TZ,
+                month: 'short', day: 'numeric', year: 'numeric',
+                hour: 'numeric', minute: '2-digit', second: '2-digit',
+                timeZoneName: 'short'
+            });
         }
         // Populates the time filter panel's min/max/default values and day presets
         // based on the imageData actually loaded (not a hardcoded assumption).
@@ -654,6 +706,16 @@
             const hintEl = document.getElementById('tf-range-hint');
             const presetsEl = document.getElementById('tf-presets');
             presetsEl.innerHTML = '';
+
+            // Inputs are bounded by the full collection window (Aug 14–15 Eastern),
+            // so every day in the window is selectable even if data is sparse.
+            const windowMin = msToDatetimeLocal(Date.parse(START_DATE));
+            const windowMax = msToDatetimeLocal(Date.parse(END_DATE) - 1000);
+            startInput.min = windowMin;
+            startInput.max = windowMax;
+            endInput.min = windowMin;
+            endInput.max = windowMax;
+
             if (times.length === 0) {
                 countEl.textContent = 'No timestamped images loaded';
                 hintEl.textContent = '';
@@ -664,24 +726,15 @@
             }
             const minTime = minOf(times);
             const maxTime = maxOf(times);
-            const minVal = msToDatetimeLocal(minTime);
-            const maxVal = msToDatetimeLocal(maxTime);
-            startInput.min = minVal;
-            startInput.max = maxVal;
-            endInput.min = minVal;
-            endInput.max = maxVal;
-            startInput.value = minVal;
-            endInput.value = maxVal;
+            startInput.value = msToDatetimeLocal(minTime);
+            endInput.value = msToDatetimeLocal(maxTime);
             countEl.textContent = `Showing ${imageData.length} of ${imageData.length} images`;
             hintEl.textContent = `Data available: ${msToDisplay(minTime)} – ${msToDisplay(maxTime)}`;
 
-            // Build one quick-filter button per distinct local calendar date present in
-            // the data, so a single click can isolate e.g. "just the overnight pass"
-            // without needing to hand-type a date/time range.
+            // One quick-filter button per Eastern calendar date present in the data.
             const dayBounds = {}; // 'YYYY-MM-DD' -> {min, max}
             times.forEach(t => {
-                const d = new Date(t);
-                const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+                const key = easternDayKey(t);
                 if (!dayBounds[key]) dayBounds[key] = { min: t, max: t };
                 if (t < dayBounds[key].min) dayBounds[key].min = t;
                 if (t > dayBounds[key].max) dayBounds[key].max = t;
@@ -695,8 +748,7 @@
             presetsEl.appendChild(allBtn);
             Object.keys(dayBounds).sort().forEach(key => {
                 const btn = document.createElement('button');
-                const d = new Date(dayBounds[key].min);
-                btn.textContent = d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+                btn.textContent = new Date(dayBounds[key].min).toLocaleDateString('en-US', { timeZone: DISPLAY_TZ, month: 'short', day: 'numeric' });
                 btn.title = `${msToDisplay(dayBounds[key].min)} – ${msToDisplay(dayBounds[key].max)}`;
                 btn.addEventListener('click', (e) => {
                     e.stopPropagation();
@@ -717,8 +769,7 @@
             });
         }
         // Applies a start/end ms range as the active time filter, updates the inputs,
-        // count text, badge, and re-renders the mini map. Shared by the Apply button
-        // and the day-preset quick buttons.
+        // count text, badge, and re-renders the mini map.
         function applyTimeFilter(startMs, endMs) {
             const countEl = document.getElementById('tf-count');
             if (startMs === null || endMs === null || isNaN(startMs) || isNaN(endMs) || startMs > endMs) {
@@ -741,9 +792,6 @@
             initTimeFilterControls();
             addImagesToMiniMap();
         }
-        // Keeps a small always-visible "X / Y" badge on the mini map in sync, so it's
-        // obvious at a glance whether a time filter is narrowing what's shown — even
-        // with the filter panel closed.
         function updateMiniMapBadge() {
             const badge = document.getElementById('mini-map-badge');
             if (imageData.length === 0) {
@@ -767,10 +815,8 @@
             console.log(`Created ${features.length} features for map`);
             const addLayers = () => {
                 if (miniMap.getSource('images')) {
-                    console.log('Updating existing source');
                     miniMap.getSource('images').setData({ type: 'FeatureCollection', features });
                 } else {
-                    console.log('Adding new source and layers');
                     miniMap.addSource('images', {
                         type: 'geojson',
                         data: { type: 'FeatureCollection', features }
@@ -850,7 +896,6 @@
                         return bounds.extend(coord);
                     }, new maplibregl.LngLatBounds(coords[0], coords[0]));
                     miniMap.fitBounds(bounds, { padding: 20 });
-                    console.log('Fitted bounds to show all images');
                 }
             };
             if (miniMap.loaded() || miniMap.isStyleLoaded?.()) {
@@ -951,7 +996,7 @@
         viewer.on('position', updateMiniMapPosition);
         viewer.on('pov', updateMiniMapPosition);
         document.getElementById('mapillary-link-btn').addEventListener('click', () => {
-            window.open('https://www.mapillary.com/app/user/TimmonsPavement?lat=38.91797157054734&lng=-78.19245575081266&z=14&dateFrom=2026-08-14&username%5B%5D=TimmonsPavement&dateTo=2026-08-15&pKey=711601415300444', '_blank');
+            window.open('https://www.mapillary.com/app/user/TimmonsPavement?lat=38.91797157054734&lng=-78.19245575081266&z=14&dateFrom=2026-08-14&username%5B%5D=TimmonsPavement&dateTo=2026-08-16&pKey=711601415300444', '_blank');
         });
         document.getElementById('reload-minimap-btn').addEventListener('click', () => {
             const btn = document.getElementById('reload-minimap-btn');
@@ -969,39 +1014,32 @@
                 });
             }
 
-            fetchUserImages().then(() => {
+            fetchUserImages().finally(() => {
                 btn.disabled = false;
-                btn.textContent = '🔄 Reload';
-            }).catch(() => {
-                btn.disabled = false;
-                btn.textContent = '🔄 Reload';
+                btn.textContent = '🔄 Force API Reload';
             });
         });
-        // Toggle the time filter panel open/closed
         document.getElementById('time-filter-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             document.getElementById('time-filter-panel').classList.toggle('visible');
         });
-        // Apply the selected date/time range as a filter on the mini map's image points
+        // Apply the selected Eastern date/time range as a filter on the mini map's points
         document.getElementById('tf-apply-btn').addEventListener('click', (e) => {
             e.stopPropagation();
-            const startInput = document.getElementById('tf-start');
-            const endInput = document.getElementById('tf-end');
+            const startVal = document.getElementById('tf-start').value;
+            const endVal = document.getElementById('tf-end').value;
             const countEl = document.getElementById('tf-count');
-            const startVal = startInput.value;
-            const endVal = endInput.value;
             if (!startVal || !endVal) {
                 countEl.textContent = 'Please select both a start and end time';
                 return;
             }
-            applyTimeFilter(new Date(startVal).getTime(), new Date(endVal).getTime());
+            // +999ms so the "To" second is inclusive of sub-second capture times
+            applyTimeFilter(datetimeLocalToMs(startVal), datetimeLocalToMs(endVal) + 999);
         });
-        // Reset the time filter back to showing all loaded images
         document.getElementById('tf-reset-btn').addEventListener('click', (e) => {
             e.stopPropagation();
             resetTimeFilter();
         });
-        // Prevent clicks inside the panel from closing it via any future document-level listeners
         document.getElementById('time-filter-panel').addEventListener('click', (e) => {
             e.stopPropagation();
         });
@@ -1057,24 +1095,14 @@
                 btn.textContent = 'Show FOV';
             }
         });
-        // Toggle mini map expansion
         document.getElementById('expand-minimap-btn').addEventListener('click', (e) => {
-            e.stopPropagation(); // Prevent event bubbling
+            e.stopPropagation();
             const miniMapElement = document.getElementById('mini-map');
             const expandBtn = document.getElementById('expand-minimap-btn');
 
             miniMapElement.classList.toggle('expanded');
+            expandBtn.title = miniMapElement.classList.contains('expanded') ? 'Collapse Map' : 'Expand Map';
 
-            // Change icon based on state
-            if (miniMapElement.classList.contains('expanded')) {
-                expandBtn.textContent = '⛶'; // Could also use '✕' or '◱'
-                expandBtn.title = 'Collapse Map';
-            } else {
-                expandBtn.textContent = '⛶';
-                expandBtn.title = 'Expand Map';
-            }
-
-            // Resize the map after transition completes
             setTimeout(() => {
                 miniMap.resize();
             }, 300);
